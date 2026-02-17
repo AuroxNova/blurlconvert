@@ -10,7 +10,10 @@ Reads Decrypts and Converts blurl files & blurl json files.
 - Fortnite Changed how MPD Files are structured, instead of working with Segments, Now it's working uploading the full song but encrypted
 
 - Example: instead of init_0.mp4 to init_203.mp4, now is main_0_dashinit.mp4 (for festival tracks)
+
 main_0_0_dashinit.mp4 (for Preview tracks) [Those are not encrypted anymore, bc it doesn't make any sense encrypting the previews lol]
+
+- This program is still working with old mpd files, downloading the segments, etc.
 
 # How To Build EXE file
 - Open CMD on the folder path and Type:
