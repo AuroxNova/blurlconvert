@@ -7,7 +7,7 @@ Reads Decrypts and Converts blurl files & blurl json files.
 - Install Golang to build code into a exe file
 
 # Why this new update?
-- Fortnite Changed how MPD Files are structured, instead of working with Segments, Now it's working upload the full song but encrypted
+- Fortnite Changed how MPD Files are structured, instead of working with Segments, Now it's working uploading the full song but encrypted
 
 - Example: instead of init_0.mp4 to init_203.mp4, now is main_0_dashinit.mp4 (for festival tracks)
 main_0_0_dashinit.mp4 (for Preview tracks) [Those are not encrypted anymore, bc it doesn't make any sense encrypting the previews lol]
