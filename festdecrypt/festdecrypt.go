@@ -23,57 +23,72 @@ func ParseJsonFromDecryptedBlob(blob string) string {
 }
 
 func decryptEnvelope(EVString string, Bearer string) (string, error) {
-	Envelope, err := base64.StdEncoding.DecodeString(EVString)
+	envelope, err := base64.StdEncoding.DecodeString(EVString)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode envelope: %s", err)
 	}
 
-	if Envelope[0] != 1 {
+	if len(envelope) < 5 {
+		return "", errors.New("envelope is too short")
+	}
+
+	if envelope[0] != 1 {
 		return "", errors.New("envelope header is invalid")
 	}
 
-	fourthbyteofEnv := int(Envelope[3])
-	fifthbyteofEnv := int(Envelope[4])
+	fourthbyteofEnv := int(envelope[3])
+	fifthbyteofEnv := int(envelope[4])
 
-	Envelope = Envelope[5:]
+	envelope = envelope[5:]
 
-	if len(Bearer) >= fourthbyteofEnv {
-		subkey := []byte(Bearer[len(Bearer)-fourthbyteofEnv:])
-
-		if len(subkey) == fourthbyteofEnv {
-			finalkey := append([]byte(Envelope[len(Envelope)-(0x10-fourthbyteofEnv):]), subkey...)
-
-			startIndex := fourthbyteofEnv + len(Envelope) - 0x10
-			endIndex := startIndex + (0x10 - fourthbyteofEnv)
-
-			Envelope = append(Envelope[:startIndex], Envelope[endIndex:]...)
-
-			if (len(Envelope)-fifthbyteofEnv)%16 == 0 {
-				encryptedIntArray := Envelope[fifthbyteofEnv:]
-
-				IV := make([]byte, aes.BlockSize)
-
-				block, err := aes.NewCipher(finalkey)
-				if err != nil {
-					return "", err
-				}
-
-				if len(encryptedIntArray)%aes.BlockSize != 0 {
-					return "", err
-				}
-
-				cipher.NewCBCDecrypter(block, IV).CryptBlocks(encryptedIntArray, encryptedIntArray)
-
-				return ParseJsonFromDecryptedBlob(string(encryptedIntArray)), nil
-			}
-
-		} else {
-			return "", errors.New("invalid bearer subkey length")
-		}
+	if fourthbyteofEnv > 0x10 {
+		return "", errors.New("invalid bearer subkey length")
 	}
 
-	return "", nil
+	if len(Bearer) < fourthbyteofEnv {
+		return "", errors.New("bearer is shorter than the envelope subkey length")
+	}
 
+	subkey := []byte(Bearer[len(Bearer)-fourthbyteofEnv:])
+	if len(subkey) != fourthbyteofEnv {
+		return "", errors.New("invalid bearer subkey length")
+	}
+
+	tailLen := 0x10 - fourthbyteofEnv
+	if len(envelope) < tailLen {
+		return "", errors.New("envelope is too short for the key material")
+	}
+
+	finalkey := make([]byte, 0, 0x10)
+	finalkey = append(finalkey, envelope[len(envelope)-tailLen:]...)
+	finalkey = append(finalkey, subkey...)
+
+	startIndex := fourthbyteofEnv + len(envelope) - 0x10
+	endIndex := startIndex + tailLen
+	if startIndex < 0 || endIndex > len(envelope) {
+		return "", errors.New("invalid envelope offsets")
+	}
+
+	envelope = append(envelope[:startIndex], envelope[endIndex:]...)
+
+	if fifthbyteofEnv > len(envelope) {
+		return "", errors.New("invalid envelope payload offset")
+	}
+
+	encryptedIntArray := envelope[fifthbyteofEnv:]
+	if len(encryptedIntArray)%aes.BlockSize != 0 {
+		return "", fmt.Errorf("encrypted payload length %d is not a multiple of the block size", len(encryptedIntArray))
+	}
+
+	block, err := aes.NewCipher(finalkey)
+	if err != nil {
+		return "", err
+	}
+
+	IV := make([]byte, aes.BlockSize)
+	cipher.NewCBCDecrypter(block, IV).CryptBlocks(encryptedIntArray, encryptedIntArray)
+
+	return ParseJsonFromDecryptedBlob(string(encryptedIntArray)), nil
 }
 
 type CDMJson struct {

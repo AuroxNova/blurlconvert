@@ -112,7 +112,7 @@ type MPD struct {
 
 func isDirExists(path string) bool {
 	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
+	if err != nil {
 		return false
 	}
 	return info.IsDir()
@@ -194,13 +194,18 @@ func RemoveDuplicateUUIDPath(inputURL string) (string, error) {
 }
 
 func GetPlaylistMetadataByID(url string) (*MPD, error) {
-	res, err := http.Get(url)
+	client := &http.Client{Timeout: timeout}
+	res, err := client.Get(url)
 
 	if err != nil {
 		return nil, err
 	}
 
 	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status fetching MPD: %s", res.Status)
+	}
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
@@ -234,73 +239,73 @@ func downloadWithRetry(url, filepath string) error {
 	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		resp, err := client.Get(url)
-		if err != nil {
-			if attempt == maxRetries {
-				return fmt.Errorf("failed after %d attempts: %v", maxRetries, err)
-			}
-			time.Sleep(retryDelay * time.Duration(attempt))
-			continue
+		retryable, err := downloadOnce(client, url, filepath)
+		if err == nil {
+			return nil
 		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			if attempt == maxRetries {
-				return fmt.Errorf("bad status after %d attempts: %s", maxRetries, resp.Status)
-			}
-			time.Sleep(retryDelay * time.Duration(attempt))
-			continue
-		}
-
-		tempFile := filepath + ".tmp"
-		out, err := os.Create(tempFile)
-		if err != nil {
+		if !retryable {
 			return err
 		}
-
-		_, err = io.Copy(out, resp.Body)
-		out.Close()
-
-		if err != nil {
-			os.Remove(tempFile)
-			if attempt == maxRetries {
-				return err
-			}
-			time.Sleep(retryDelay * time.Duration(attempt))
-			continue
+		if attempt == maxRetries {
+			return fmt.Errorf("failed after %d attempts: %v", maxRetries, err)
 		}
-
-		if _, err := os.Stat(filepath); err == nil {
-			os.Remove(filepath)
-		}
-
-		err = os.Rename(tempFile, filepath)
-		if err != nil {
-			err = copyFile(tempFile, filepath)
-			if err != nil {
-				os.Remove(tempFile)
-				if attempt == maxRetries {
-					return fmt.Errorf("failed to create final file: %v", err)
-				}
-				time.Sleep(retryDelay * time.Duration(attempt))
-				continue
-			}
-			os.Remove(tempFile)
-		}
-
-		if !isFileValid(filepath) {
-			os.Remove(filepath)
-			if attempt == maxRetries {
-				return fmt.Errorf("file integrity check failed after %d attempts", maxRetries)
-			}
-			time.Sleep(retryDelay * time.Duration(attempt))
-			continue
-		}
-
-		return nil
+		time.Sleep(retryDelay * time.Duration(attempt))
 	}
 
 	return fmt.Errorf("unknown error downloading %s", url)
+}
+
+func downloadOnce(client *http.Client, url, filepath string) (bool, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// 4xx is usually permanent; 408 and 429 are worth another try.
+		retryable := resp.StatusCode >= 500 ||
+			resp.StatusCode == http.StatusRequestTimeout ||
+			resp.StatusCode == http.StatusTooManyRequests
+		return retryable, fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	tempFile := filepath + ".tmp"
+	out, err := os.Create(tempFile)
+	if err != nil {
+		return true, err
+	}
+
+	_, copyErr := io.Copy(out, resp.Body)
+	closeErr := out.Close()
+
+	if copyErr != nil {
+		os.Remove(tempFile)
+		return true, copyErr
+	}
+	if closeErr != nil {
+		os.Remove(tempFile)
+		return true, closeErr
+	}
+
+	if _, err := os.Stat(filepath); err == nil {
+		os.Remove(filepath)
+	}
+
+	if err := os.Rename(tempFile, filepath); err != nil {
+		if err := copyFile(tempFile, filepath); err != nil {
+			os.Remove(tempFile)
+			return true, fmt.Errorf("failed to create final file: %v", err)
+		}
+		os.Remove(tempFile)
+	}
+
+	if !isFileValid(filepath) {
+		os.Remove(filepath)
+		return true, fmt.Errorf("file integrity check failed")
+	}
+
+	return false, nil
 }
 
 func copyFile(src, dst string) error {
@@ -353,11 +358,31 @@ func httpRangeGet(u string, start, end int64) ([]byte, error) {
 	}
 	defer res.Body.Close()
 
-	if res.StatusCode != http.StatusPartialContent && res.StatusCode != http.StatusOK {
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.StatusCode == http.StatusPartialContent {
+		return body, nil
+	}
+
+	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("bad status: %s", res.Status)
 	}
 
-	return io.ReadAll(res.Body)
+	n := int64(len(body))
+	want := end - start + 1
+	if n == want {
+		return body, nil
+	}
+	if n > end {
+		return body[start : end+1], nil
+	}
+	if n > start {
+		return body[start:], nil
+	}
+	return nil, fmt.Errorf("range %d-%d out of bounds (got %d bytes)", start, end, n)
 }
 
 type sidxInfo struct {
@@ -484,7 +509,7 @@ func countSegmentsFromSegmentBase(fullURL string, initRange string, indexRange s
 	return len(sidx.referencedSizes), sidx, sidxStartInFile, nil
 }
 
-func HandleDownloadTrack(mediatype string, id string, numberofsegments float64, baseurl string, initmp4 string, adaptation string, key string, mediaTemplate string, startNumber int, fullFileURL string, initRange string, indexRange string) error {
+func HandleDownloadTrack(mediatype string, id string, numberofsegments float64, baseurl string, initmp4 string, adaptation string, key string, mediaTemplate string, startNumber int, fullFileURL string, initRange string, indexRange string, outPath string) error {
 	if !isDirExists("downloads") {
 		err := os.Mkdir("downloads", 0755)
 		if err != nil {
@@ -549,18 +574,12 @@ func HandleDownloadTrack(mediatype string, id string, numberofsegments float64, 
 		}
 
 		if len(key) > 0 {
-			cmd := exec.Command("ffmpeg", "-decryption_key", key, "-i", initPath, "-c", "copy", fmt.Sprintf("%s.mp4", id))
-			err := cmd.Run()
-			if err != nil {
-				return err
-			}
-		} else {
-			finalPath := fmt.Sprintf("master_%s.mp4", mediatype)
-			os.Remove(finalPath)
-			err = copyFile(initPath, finalPath)
-			if err != nil {
-				return err
-			}
+			return DecryptPlaylist(initPath, outPath, key)
+		}
+
+		os.Remove(outPath)
+		if err := copyFile(initPath, outPath); err != nil {
+			return err
 		}
 
 		return nil
@@ -583,18 +602,17 @@ func HandleDownloadTrack(mediatype string, id string, numberofsegments float64, 
 
 	if mediaTemplate == "" {
 		if len(key) > 0 {
-			DecryptPlaylist(id, initmp4, key)
-		} else {
-			finalPath := fmt.Sprintf("master_%s.mp4", mediatype)
-			if _, err := os.Stat(finalPath); err == nil {
-				os.Remove(finalPath)
-			}
-
-			err = copyFile(initPath, finalPath)
-			if err != nil {
-				return fmt.Errorf("error creating final file: %v", err)
-			}
+			return DecryptPlaylist(initPath, outPath, key)
 		}
+
+		if _, err := os.Stat(outPath); err == nil {
+			os.Remove(outPath)
+		}
+
+		if err := copyFile(initPath, outPath); err != nil {
+			return fmt.Errorf("error creating final file: %v", err)
+		}
+
 		return nil
 	}
 
@@ -644,10 +662,16 @@ func HandleDownloadTrack(mediatype string, id string, numberofsegments float64, 
 	wg.Wait()
 	close(errChan)
 
+	failures := 0
 	for err := range errChan {
 		if err != nil {
 			fmt.Println(err.Error())
+			failures++
 		}
+	}
+
+	if failures > 0 {
+		return fmt.Errorf("%d of %d segments failed to download", failures, segmentCount)
 	}
 
 	for _, filename := range files {
@@ -658,7 +682,7 @@ func HandleDownloadTrack(mediatype string, id string, numberofsegments float64, 
 		filePath := fmt.Sprintf("./downloads/%s", filename)
 		file, err := os.Open(filePath)
 		if err != nil {
-			continue
+			return fmt.Errorf("error opening segment %s: %v", filename, err)
 		}
 
 		_, err = io.Copy(mastertrack, file)
@@ -666,55 +690,57 @@ func HandleDownloadTrack(mediatype string, id string, numberofsegments float64, 
 		os.Remove(filePath)
 
 		if err != nil {
-			continue
+			return fmt.Errorf("error appending segment %s: %v", filename, err)
 		}
 	}
 
 	if len(key) > 0 {
-		DecryptPlaylist(id, initmp4, key)
-	} else {
-		finalPath := fmt.Sprintf("master_%s.mp4", mediatype)
-		if _, err := os.Stat(finalPath); err == nil {
-			os.Remove(finalPath)
-		}
+		return DecryptPlaylist(initPath, outPath, key)
+	}
 
-		err = copyFile(initPath, finalPath)
-		if err != nil {
-			return fmt.Errorf("error creating final file: %v", err)
-		}
+	if _, err := os.Stat(outPath); err == nil {
+		os.Remove(outPath)
+	}
+
+	if err := copyFile(initPath, outPath); err != nil {
+		return fmt.Errorf("error creating final file: %v", err)
 	}
 
 	return nil
 }
 
-func DecryptPlaylist(id string, initmp4 string, key string) {
-	cmd := exec.Command("ffmpeg", "-decryption_key", key, "-i", fmt.Sprintf("./downloads/%s", initmp4), "-c", "copy", fmt.Sprintf("%s.mp4", id))
+func DecryptPlaylist(inputPath string, outPath string, key string) error {
+	cmd := exec.Command("ffmpeg", "-y", "-nostdin", "-decryption_key", key, "-i", inputPath, "-c", "copy", outPath)
 
-	err := cmd.Run()
-	if err != nil {
-		fmt.Println("Error running ffmpeg command:", err)
-		return
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("error running ffmpeg decrypt: %v", err)
 	}
+
+	if !isFileValid(outPath) {
+		return fmt.Errorf("ffmpeg produced no output at %s", outPath)
+	}
+
+	return nil
 }
 
-func Merge(videofile string, audiofile string, kid string) {
-	cmd := exec.Command("ffmpeg", "-i", videofile, "-i", audiofile, "-c:v", "copy", "-c:a", "copy", fmt.Sprintf("%s_master.mp4", kid))
+func Merge(videofile string, audiofile string, outPath string) error {
+	cmd := exec.Command("ffmpeg", "-y", "-nostdin", "-i", videofile, "-i", audiofile, "-c:v", "copy", "-c:a", "copy", outPath)
 
-	err := cmd.Run()
-	if err != nil {
-		fmt.Println("Error running ffmpeg command:", err)
-		return
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("error running ffmpeg merge: %v", err)
 	}
 
-	err = os.Remove(videofile)
-	if err != nil {
-		fmt.Println("Error deleting video file:", err)
-		return
+	if !isFileValid(outPath) {
+		return fmt.Errorf("ffmpeg produced no output at %s", outPath)
 	}
 
-	err = os.Remove(audiofile)
-	if err != nil {
-		fmt.Println("Error deleting audio file:", err)
-		return
+	if err := os.Remove(videofile); err != nil {
+		return fmt.Errorf("error deleting video file: %v", err)
 	}
+
+	if err := os.Remove(audiofile); err != nil {
+		return fmt.Errorf("error deleting audio file: %v", err)
+	}
+
+	return nil
 }

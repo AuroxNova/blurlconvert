@@ -7,20 +7,59 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
+var outBase string
+
+func trackOutPath(contentType string, setCount int) string {
+	if outBase == "" {
+		return fmt.Sprintf("master_%s.mp4", contentType)
+	}
+	if setCount <= 1 {
+		return outBase
+	}
+	ext := filepath.Ext(outBase)
+	return strings.TrimSuffix(outBase, ext) + "_" + contentType + ext
+}
+
+func withIndex(p string, i int) string {
+	ext := filepath.Ext(p)
+	return fmt.Sprintf("%s_%d%s", strings.TrimSuffix(p, ext), i, ext)
+}
+
+func mergedOutPath(mpddata *MPD) string {
+	if outBase != "" {
+		return outBase
+	}
+
+	kid := ""
+	if len(mpddata.Period.AdaptationSet[0].ContentProtection) > 0 {
+		kid = EncodeToBase62(mpddata.Period.AdaptationSet[0].ContentProtection[0].DefaultKID)
+	}
+	if len(kid) >= 8 {
+		return kid[:8] + "_master.mp4"
+	}
+
+	return "master.mp4"
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: program <input.blurl|input.json> <output>")
+		fmt.Println("Usage: program <input.blurl|input.json> [output]")
 		return
 	}
 
 	if !strings.HasSuffix(os.Args[1], ".blurl") && !strings.HasSuffix(os.Args[1], ".json") {
 		fmt.Println("The Input File must be a .blurl or .json file")
 		return
+	}
+
+	if len(os.Args) > 2 {
+		outBase = strings.TrimSpace(os.Args[2])
 	}
 
 	var blurl BLURL
@@ -162,7 +201,13 @@ func main() {
 		}
 	}
 
-	for _, adaptation := range mpddata.Period.AdaptationSet {
+	defer os.RemoveAll("./downloads")
+
+	failedTracks := 0
+	usedTypes := map[string]bool{}
+	trackOut := map[string]string{}
+
+	for ai, adaptation := range mpddata.Period.AdaptationSet {
 		if len(adaptation.Representation) == 0 {
 			fmt.Printf("Error Downloading Track: no representations\n")
 			continue
@@ -234,9 +279,16 @@ func main() {
 			}
 		}
 
+		outPath := trackOutPath(contentType, len(mpddata.Period.AdaptationSet))
+		if usedTypes[contentType] {
+			outPath = withIndex(outPath, ai)
+		}
+		usedTypes[contentType] = true
+		trackOut[contentType] = outPath
+
 		err := HandleDownloadTrack(
 			contentType,
-			fmt.Sprintf("master_%s", contentType),
+			fmt.Sprintf("master_%s_%d", contentType, ai),
 			numberOfSegments,
 			getBaseURL(mediaurl),
 			initFile,
@@ -247,30 +299,39 @@ func main() {
 			fullFileURL,
 			initRange,
 			indexRange,
+			outPath,
 		)
 
 		if err != nil {
 			fmt.Printf("Error Downloading %s Track: %v\n", contentType, err)
+			failedTracks++
 			continue
 		}
 	}
 
 	if len(mpddata.Period.AdaptationSet) == 2 {
-		videoFile := "master_video.mp4"
-		audioFile := "master_audio.mp4"
+		videoFile := trackOut["video"]
+		audioFile := trackOut["audio"]
 
-		if _, err := os.Stat(videoFile); err == nil {
-			if _, err := os.Stat(audioFile); err == nil {
-				fmt.Println("Merging audio and video tracks...")
-				Merge(videoFile, audioFile, EncodeToBase62(mpddata.Period.AdaptationSet[0].ContentProtection[0].DefaultKID)[:8])
+		if videoFile != "" && audioFile != "" {
+			if _, err := os.Stat(videoFile); err == nil {
+				if _, err := os.Stat(audioFile); err == nil {
+					fmt.Println("Merging audio and video tracks...")
+					if err := Merge(videoFile, audioFile, mergedOutPath(mpddata)); err != nil {
+						fmt.Printf("Error merging tracks: %v\n", err)
+					}
+				}
 			}
 		}
 	}
 
 	time.Sleep(1 * time.Second)
 
-	fmt.Println("Cleaning up temporary files...")
-	os.RemoveAll("./downloads")
+	if failedTracks > 0 {
+		fmt.Printf("Finished with %d failed track(s).\n", failedTracks)
+		os.RemoveAll("./downloads")
+		os.Exit(1)
+	}
 
 	fmt.Println("Process completed successfully!")
 }

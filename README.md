@@ -35,3 +35,11 @@ To run on the build code
 ```yaml
 blurlconvert.exe master.blurl
 ```
+
+# Optional output path
+Pass a second argument to choose where the result goes. Without it, files are written to the current folder as `master_audio.mp4`, `master_video.mp4` or `<kid>_master.mp4`.
+```yaml
+blurlconvert.exe master.blurl "C:\Users\PC\Music\song.mp4"
+```
+With both an audio and a video track the name is used as a base (`song_audio.mp4`, `song_video.mp4`) and the merged result is written to `song.mp4`.
+

@@ -7,10 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strconv"
 )
+
+const maxDecompressedSize = 64 << 20
 
 type Playlist struct {
 	Data     string  `json:"data"`
@@ -36,9 +37,13 @@ func decompressData(data io.Reader) ([]byte, error) {
 	}
 	defer decompressor.Close()
 
-	_, err = io.Copy(&decompressedData, decompressor)
+	_, err = io.Copy(&decompressedData, io.LimitReader(decompressor, maxDecompressedSize+1))
 	if err != nil {
 		return nil, err
+	}
+
+	if decompressedData.Len() > maxDecompressedSize {
+		return nil, fmt.Errorf("decompressed payload exceeds %d bytes", maxDecompressedSize)
 	}
 
 	return decompressedData.Bytes(), nil
@@ -77,9 +82,9 @@ func parseBLURLFromJSON(inblurl *BLURL, filepath string) error {
 	}
 	defer file.Close()
 
-	err = json.NewDecoder(file).Decode(&inblurl)
+	err = json.NewDecoder(file).Decode(inblurl)
 	if err != nil {
-		log.Fatalf("Error decoding JSON: %v", err)
+		return fmt.Errorf("error decoding JSON: %v", err)
 	}
 
 	return nil
